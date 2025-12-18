@@ -1,0 +1,211 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <time.h>
+
+// definition of constants
+#define BUFFER_SIZE 128
+#define ERROR_MSG_SIZE 100
+#define FORK_FAILED_LEN 12
+#define READ_EOF_OR_ERROR -1
+#define READ_EXIT_COMMAND 0
+#define READ_EMPTY_COMMAND 1
+#define READ_VALID_COMMAND 2
+
+// pointers to strings
+char *welcome = "Bienvenue dans le Shell ENSEA.\nPour quitter, tapez 'exit'.";
+char *prompt = "\nenseash % ";
+char *bye = "Bye bye...\n";
+
+// function prototypes
+void print_welcome_message(void);
+void print_prompt(int last_status, long execution_time_ms);
+void print_bye_message(void);
+int read_user_command(char *buffer, int buffer_size);
+int execute_simple_command(char *command, long *execution_time_ms);
+char **parse_command_arguments(char *command);
+
+int main(int argc, char *argv[]) {
+    // definition of variables
+    char buffer[BUFFER_SIZE];
+    int command_result;
+    int last_status = -1;
+    long execution_time_ms = 0;
+
+    print_welcome_message();
+
+    // main REPL loop
+	while (1) {
+        print_prompt(last_status, execution_time_ms);
+
+		command_result = read_user_command(buffer, BUFFER_SIZE);
+
+		// check result of command reading
+		if (command_result == READ_EOF_OR_ERROR) {      // ctrl+D or read error
+			print_bye_message();
+			break;
+		} else if (command_result == READ_EXIT_COMMAND) { // exit command
+			print_bye_message();
+			break;
+		} else if (command_result == READ_EMPTY_COMMAND) { // empty command
+				   continue;  // skip and show prompt again
+		}
+
+        last_status = execute_simple_command(buffer, &execution_time_ms);
+	}
+
+	return 0;
+}
+
+void print_welcome_message(void) {
+   write(STDOUT_FILENO, welcome, strlen(welcome));
+}
+
+void print_prompt(int last_status, long execution_time_ms) {
+    char prompt_buffer[BUFFER_SIZE];
+
+    if (last_status == -1) {
+        // first prompt, no command executed
+        snprintf(prompt_buffer, BUFFER_SIZE, "enseash %% ");
+    } else if (WIFEXITED(last_status)) {
+        // command finished normaly
+        int exit_code = WEXITSTATUS(last_status);
+        snprintf(prompt_buffer, BUFFER_SIZE,
+                "enseash [exit:%d|%ldms] %% ", exit_code, execution_time_ms);
+	} else if (WIFSIGNALED(last_status)) {
+        // command finished by a signal
+        int signal_num = WTERMSIG(last_status);
+        snprintf(prompt_buffer, BUFFER_SIZE,
+                "enseash [sign:%d|%ldms] %% ", signal_num, execution_time_ms);
+    } else {
+        // default outcome
+        snprintf(prompt_buffer, BUFFER_SIZE, "enseash %% ");
+    }
+
+    write(STDOUT_FILENO, "\n", 1);
+    write(STDOUT_FILENO, prompt_buffer, strlen(prompt_buffer));
+}
+
+void print_bye_message(void) {
+	write(STDOUT_FILENO, bye, strlen(bye));
+}
+
+// returns: -1 = EOF/error, 0 = exit command, 1 = empty command, 2 = valid command
+int read_user_command(char *buffer, int buffer_size) {
+   ssize_t bytes_read;
+
+   bytes_read = read(STDIN_FILENO, buffer, buffer_size - 1);
+
+   // check for EOF (ctrl+D) or read error
+   if (bytes_read <= 0) {
+	   write(STDOUT_FILENO, "\n", 1);
+	   return READ_EOF_OR_ERROR;
+   }
+
+   // null-terminate the string
+   buffer[bytes_read] = '\0';
+
+   // remove newline character if present
+   if (buffer[bytes_read - 1] == '\n') {
+	   buffer[bytes_read - 1] = '\0';
+	   bytes_read--;
+   }
+
+   // check for exit command
+   if (strcmp(buffer, "exit") == 0) {
+	   return READ_EXIT_COMMAND;
+   }
+
+   // check for empty command
+   if (bytes_read == 0) {
+	   return READ_EMPTY_COMMAND;
+   }
+
+   return READ_VALID_COMMAND;  // valid command
+}
+
+// returns: 0 on success, -1 on failure
+int execute_simple_command(char *command, long *execution_time_ms) {
+	pid_t pid;
+	int status;
+	struct timespec start, end;
+    char **args;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+	// fork a child process
+	pid = fork();
+
+	if (pid == 0) {
+	// child process
+
+	args = parse_command_arguments(command);
+
+	// execlp executes the command
+    execvp(args[0], args);
+
+	// if execlp returns, there was an error
+	char error_msg[ERROR_MSG_SIZE];
+	snprintf(error_msg, sizeof(error_msg), "Command not found: %s\n", command);
+	write(STDERR_FILENO, error_msg, strlen(error_msg));
+    // free allocated memory in child before exiting
+    for (int i = 0; args[i] != NULL; i++) {
+        free(args[i]);
+    }
+	_exit(127);
+
+	} else if (pid > 0) {
+	// parent process
+
+	// wait for the child to finish
+	waitpid(pid, &status, 0);
+
+	// ends timer
+	clock_gettime(CLOCK_MONOTONIC, &end);
+
+	// calculate time in miliseconds
+	*execution_time_ms = (end.tv_sec - start.tv_sec) * 1000;
+    *execution_time_ms += (end.tv_nsec - start.tv_nsec) / 1000000;
+
+	return status;
+
+	} else {
+	  // fork failed
+		write(STDERR_FILENO, "Fork failed\n", FORK_FAILED_LEN);
+		*execution_time_ms = 0;
+		return -1;
+	}
+}
+
+// new function to divide command in arguments
+char **parse_command_arguments(char *command) {
+    static char *args[BUFFER_SIZE / 2];
+    char *token;
+    int i = 0;
+
+    // use a copy to not modify the original
+    char command_copy[BUFFER_SIZE];
+    strncpy(command_copy, command, BUFFER_SIZE - 1);
+    command_copy[BUFFER_SIZE - 1] = '\0';
+
+    // divide by spaces
+    token = strtok(command_copy, " ");
+    while (token != NULL && i < (BUFFER_SIZE / 2) - 1) {
+        args[i] = token;
+        i++;
+        token = strtok(NULL, " ");
+    }
+    args[i] = NULL;  // finish array with NULL
+
+    // copy strings to a static array
+   static char *final_args[BUFFER_SIZE / 2];
+   for (int j = 0; j < i; j++) {
+	   final_args[j] = strdup(args[j]);
+   }
+   final_args[i] = NULL;
+
+   return final_args;
+}
